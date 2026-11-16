@@ -9,7 +9,10 @@ from datetime import datetime
 from importlib.resources import files
 from pathlib import Path
 
-HUBS = (
+from .bill_text import archive_documents, document_text, document_url
+
+# Keep a record of the previous defaults so existing custom queries are preserved.
+LEGACY_HUBS = (
     ("Chat Control", "Encryption, age verification & online safety",
      "client-side scanning, encryption backdoor, end-to-end encryption, age verification, "
      "kids online safety, children harmed by AI technology, stop csam, earn it act"),
@@ -19,6 +22,27 @@ HUBS = (
     ("FISA Court Rulings", "FISA legislation & surveillance authorities",
      "foreign intelligence surveillance act, foreign intelligence surveillance court, section 702, fisa amendments act"),
 )
+DEFAULT_PHRASES = (
+    LEGACY_HUBS[0][2] + ", age assurance, age estimation, age signal, app store accountability, "
+    "parents over platforms, protecting kids from human-like chatbots",
+    "digital millennium copyright act, 17 u.s.c. 1201, section 1201 of title 17, takedown abuse, "
+    "foreign anti-digital piracy, foreign digital piracy site, copyright infringement, farm freedom to repair, "
+    "freedom for agricultural repair and maintenance, defend ip act, 17 u.s.c. 512, section 512 of title 17",
+    "foreign intelligence surveillance act, foreign intelligence surveillance court, fisa amendments act, "
+    "government surveillance reform act, 50 u.s.c. 1881a, section 702 of fisa",
+)
+HUBS = tuple(
+    (name, description, phrases)
+    for (name, description, _), phrases in zip(LEGACY_HUBS, DEFAULT_PHRASES)
+)
+
+MATCH_KEYS = """
+    SELECT key FROM bill_search WHERE bill_search MATCH ?
+    UNION
+    SELECT versions.bill_key FROM bill_text_search
+    JOIN bill_text_versions AS versions ON versions.id = bill_text_search.rowid
+    WHERE bill_text_search MATCH ?
+"""
 STATES = """AL AK AZ AR CA CO CT DE FL GA HI ID IL IN IA KS KY LA ME MD MA MI MN MS MO MT NE NV NH
 NJ NM NY NC ND OH OK OR PA RI SC SD TN TX UT VT VA WA WV WI WY AS DC GU MP PR VI""".split()
 STATUSES = ("Proposed", "In Committee", "On Floor", "Passed", "Failed", "Enacted")
@@ -62,6 +86,14 @@ class Store:
                 CREATE VIRTUAL TABLE IF NOT EXISTS bill_search USING fts5(
                     key UNINDEXED, title, details, tokenize='unicode61'
                 );
+                CREATE TABLE IF NOT EXISTS bill_text_versions (
+                    id INTEGER PRIMARY KEY, package TEXT NOT NULL UNIQUE,
+                    bill_key TEXT NOT NULL, digest BLOB NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS bill_text_by_bill ON bill_text_versions(bill_key);
+                CREATE VIRTUAL TABLE IF NOT EXISTS bill_text_search USING fts5(
+                    body, tokenize='unicode61'
+                );
                 CREATE TABLE IF NOT EXISTS members (
                     id TEXT PRIMARY KEY, state TEXT NOT NULL, chamber TEXT NOT NULL,
                     district TEXT NOT NULL, data TEXT NOT NULL
@@ -83,6 +115,12 @@ class Store:
                 self.set_setting("court_filings", seed.get("filings", []), db)
                 for url, validators in seed.get("validators", {}).items():
                     self.set_setting(url, validators, db)
+            if not self.get_setting("full_text_hubs", False, db=db):
+                db.executemany(
+                    "UPDATE hubs SET phrases=? WHERE name=? AND phrases=?",
+                    ((new, name, old) for new, (name, _, old) in zip(DEFAULT_PHRASES, LEGACY_HUBS)),
+                )
+                self.set_setting("full_text_hubs", True, db)
 
     @contextmanager
     def connect(self):
@@ -112,6 +150,12 @@ class Store:
         with self.connect() as db:
             return list(db.execute("SELECT * FROM hubs ORDER BY id"))
 
+    def cached_congresses(self):
+        with self.connect() as db:
+            return {row[0] for row in db.execute(
+                "SELECT DISTINCT CAST(substr(key, 1, instr(key, '-') - 1) AS INTEGER) FROM bills"
+            )}
+
     def add_hub(self, name, phrases):
         if not name.strip() or not fts_terms(phrases):
             raise ValueError("Enter a name and at least one keyword or phrase.")
@@ -127,15 +171,65 @@ class Store:
             with self.connect() as connection:
                 return self.bills(phrases, search, status, db=connection)
         hub_query = fts_terms(phrases)
+        if not hub_query:
+            return []
         search_query = fts_terms(search)
-        query = f"({hub_query}) AND ({search_query})" if search_query else hub_query
-        rows = db.execute("""
-            SELECT b.data, b.unread FROM bill_search AS f
-            JOIN bills AS b ON f.key=b.key
-            WHERE bill_search MATCH ? AND (?='' OR b.status=?)
+        keys = MATCH_KEYS
+        params = [hub_query, hub_query]
+        if search_query:
+            keys = f"SELECT key FROM ({MATCH_KEYS}) INTERSECT SELECT key FROM ({MATCH_KEYS})"
+            params.extend([search_query, search_query])
+        rows = db.execute(f"""
+            SELECT b.data, b.unread FROM ({keys}) AS matches
+            JOIN bills AS b ON matches.key=b.key
+            WHERE (?='' OR b.status=?)
             ORDER BY b.date DESC, b.key
-        """, (query, status, status))
+        """, (*params, status, status))
         return [dict(json.loads(row["data"]), unread=bool(row["unread"])) for row in rows]
+
+    def write_bill_text(self, db, archive):
+        existing = {
+            row["package"]: (row["id"], row["digest"])
+            for row in db.execute("SELECT id,package,digest FROM bill_text_versions")
+        }
+        for package, key, digest, xml in archive_documents(archive):
+            previous = existing.get(package)
+            if previous and previous[1] == digest:
+                continue
+            body = document_text(xml)
+            if not body:
+                continue
+            if previous:
+                row_id = previous[0]
+                db.execute("UPDATE bill_text_versions SET digest=? WHERE id=?", (digest, row_id))
+                db.execute("DELETE FROM bill_text_search WHERE rowid=?", (row_id,))
+            else:
+                row_id = db.execute(
+                    "INSERT INTO bill_text_versions(package,bill_key,digest) VALUES (?,?,?)",
+                    (package, key, digest),
+                ).lastrowid
+            db.execute("INSERT INTO bill_text_search(rowid,body) VALUES (?,?)", (row_id, body))
+
+    def text_match(self, key, phrases, search=""):
+        with self.connect() as db:
+            query = fts_terms(search) or fts_terms(phrases)
+            row = db.execute("""
+                SELECT package, snippet(bill_text_search, 0, '', '', ' … ', 44) AS passage
+                FROM bill_text_search JOIN bill_text_versions AS v ON v.id=bill_text_search.rowid
+                WHERE v.bill_key=? AND bill_text_search MATCH ?
+                ORDER BY rank, package LIMIT 1
+            """, (key, query)).fetchone() if query else None
+            if row:
+                return row["package"], row["passage"], document_url(row["package"])
+            return None
+
+    def tracked_keys(self, db):
+        keys = set()
+        for (phrases,) in db.execute("SELECT phrases FROM hubs"):
+            query = fts_terms(phrases)
+            if query:
+                keys.update(row[0] for row in db.execute(MATCH_KEYS, (query, query)))
+        return keys
 
     def write_bills(self, db, bills, notify=False):
         # Build the FTS rowid map once. FTS term queries cannot index an UNINDEXED key.
@@ -167,12 +261,7 @@ class Store:
             db.execute("INSERT INTO bill_search VALUES (?,?,?)", (key, title, details))
         if not notify or not pending:
             return 0
-        tracked = {
-            row[0]
-            for hub in db.execute("SELECT phrases FROM hubs")
-            for row in db.execute("SELECT key FROM bill_search WHERE bill_search MATCH ?", (fts_terms(hub[0]),))
-        }
-        updated = pending & tracked
+        updated = pending & self.tracked_keys(db)
         db.executemany("UPDATE bills SET unread=1 WHERE key=?", ((key,) for key in updated))
         return len(updated)
 
@@ -206,11 +295,7 @@ class Store:
     def member_roles(self, member_id):
         found = {}
         with self.connect() as db:
-            tracked = {
-                row[0]
-                for hub in db.execute("SELECT phrases FROM hubs")
-                for row in db.execute("SELECT key FROM bill_search WHERE bill_search MATCH ?", (fts_terms(hub[0]),))
-            }
+            tracked = self.tracked_keys(db)
             for row in db.execute("SELECT key,data FROM bills ORDER BY date DESC"):
                 if row["key"] not in tracked:
                     continue

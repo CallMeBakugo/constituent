@@ -11,7 +11,7 @@ Constituent is a Linux desktop app for tracking U.S. federal bills and preparing
 Requires Linux, Python 3.12 or newer, and a desktop session. Install the local wheel with [pipx](https://pipx.pypa.io/). pipx installs PySide6 and its Qt runtime with the app.
 
 ```sh
-pipx install ./constituent-0.2.1-py3-none-any.whl
+pipx install ./constituent-0.2.2-py3-none-any.whl
 constituent
 ```
 
@@ -23,7 +23,7 @@ Start with `constituent --offline` to skip automatic refresh. The **Refresh** bu
 
 ## Track a bill and contact an office
 
-1. Open **Chat Control**, **DMCA Bullshit**, or **FISA Court Rulings**, or create a hub from comma-separated search phrases. Use the status filter or search inside a hub. For FISA court material, open **Court filings**.
+1. Open **Chat Control**, **DMCA Bullshit**, or **FISA Court Rulings**, or create a hub from comma-separated search phrases. Use the status filter or search inside a hub. Searches cover bill titles, summaries, subject tags, and published bill text. Matching excerpts identify the official version, which can be an earlier version or a chamber amendment. For FISA court material, open **Court filings**.
 2. Save your name, mailing address, state, and U.S. House district in **My profile**. The House.gov lookup opens separately if you need your district. Constituent matches the saved state and district against the cached office roster.
 3. Select a bill, choose **Oppose** or **Support**, and select an office. Edit the preview if needed. The app opens an email draft if its source provides an email address. With the current roster, the app copies the letter and opens the relevant contact page or official office site. Paste the letter and submit it there. A separate **Copy subject** button is available for forms with a subject field.
 4. Use **Civic diary** to review the handoff and mark it sent after you submit it. The app has no access to your mail client's outbox or the office's form submission status.
@@ -36,7 +36,7 @@ The default letter bodies are in `${XDG_CONFIG_HOME:-~/.config}/constituent/temp
 - **Directory.** [Office of the Clerk](https://clerk.house.gov/xml/lists/MemberData.xml), [House.gov](https://www.house.gov/representatives), and the [Senate’s contact feed](https://www.senate.gov/general/contact_information/senators_cfm.xml) supply sitting members and delegates, published phone numbers, Capitol office addresses, and official websites or contact links. A vacancy or district without a current office record may reduce the available contacts.
 - **Court filings.** The first page of the [FISA Court’s public-filing index](https://www.fisc.uscourts.gov/public-filings) supplies recent filing titles and dates. The app opens the official filing externally.
 
-The app refreshes on startup and every four hours while open, matching GovInfo’s stated bulk-update cadence. The initial refresh may download both bill archives, roughly 45 MB for the bundled Congress. Subsequent refreshes use conditional requests where the source provides cache validators. New actions in matched bills get an in-app badge and a notification when the session supports desktop notifications. A source failure leaves the previous cache available. Open the sync status to see refresh errors.
+The app refreshes on startup and every four hours while open, matching GovInfo’s stated bulk-update cadence. The first online refresh builds the offline text index. For the bundled Congress, the status archives are about 45 MB and the text archives are about 132 MB. The resulting SQLite cache takes roughly 390 MB. The bundled titles and summaries are available while the initial text download runs. Subsequent refreshes use conditional requests where the source provides cache validators. New actions in matched bills get an in-app badge and a notification when the session supports desktop notifications. A source failure leaves the previous cache available. Open the sync status to see refresh errors.
 
 SQLite lives under `${XDG_DATA_HOME:-~/.local/share}/constituent/`. The saved address is local and unencrypted, protected by the user’s filesystem permissions. Public-data refresh requests do not carry profile data. Opening a draft or copying a letter passes the text to the chosen application or the system clipboard.
 

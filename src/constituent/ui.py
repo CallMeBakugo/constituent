@@ -257,7 +257,7 @@ class Window(QMainWindow):
         info.setText(f"Bundled snapshot: {display_date(self.store.get_setting('snapshot'))}")
         last = self.store.get_setting("last_sync")
         message = f"Last complete refresh: {display_date(last) if last else 'None yet'}\n\n"
-        message += "Bills: GovInfo Bill Status • Directory: House Clerk, House.gov, and Senate.gov. Court filings: Foreign Intelligence Surveillance Court."
+        message += "Bills: GovInfo Bill Status and official bill text • Directory: House Clerk, House.gov, and Senate.gov. Court filings: Foreign Intelligence Surveillance Court."
         if self.sync_errors:
             message += "\n\n" + "\n".join(self.sync_errors)
         info.setInformativeText(message)
@@ -389,7 +389,7 @@ class Window(QMainWindow):
         bar = QHBoxLayout()
         bar.setSpacing(10)
         self.search = QLineEdit()
-        self.search.setPlaceholderText("Search this hub by bill, title, or keyword")
+        self.search.setPlaceholderText("Search titles, summaries, and bill text")
         self.search.setClearButtonEnabled(True)
         self.search.textChanged.connect(lambda: self.fill_bills())
         bar.addWidget(self.search, 1)
@@ -526,6 +526,18 @@ class Window(QMainWindow):
         summary_layout = box(summary, (0, 11, 0, 0), 8)
         summary_layout.addWidget(label("Official summary", "sectionTitle"))
         summary_layout.addWidget(label(bill["summary"] or "Congress has yet to publish a summary for this measure.", "", True))
+        match = self.store.text_match(bill["key"], self.hub["phrases"], self.search.text())
+        if match:
+            package, passage, source = match
+            summary_layout.addWidget(rule())
+            summary_layout.addWidget(label("Matching bill text", "sectionTitle"))
+            quote = label(passage, "", True)
+            quote.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            summary_layout.addWidget(quote)
+            summary_layout.addWidget(
+                button(f"GovInfo · {package} ↗", lambda: safe_open(source), "link"),
+                alignment=Qt.AlignmentFlag.AlignLeft,
+            )
         summary_layout.addStretch()
         tabs.addTab(summary, "Summary")
 

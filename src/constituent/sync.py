@@ -1,6 +1,8 @@
 """Refresh the public cache with conditional requests to official sources."""
 
 from datetime import date
+
+from .bill_text import archive_url as text_archive_url
 from .sources import (
     FISC_OPINIONS, GPO, HOUSE_SITES, HOUSE_XML, SENATE_XML, bills_from_archive, court_filings,
     fetch, house_members, senate_members,
@@ -18,9 +20,31 @@ def archive_url(congress, kind):
     return f"{GPO}/{congress}/{kind}/BILLSTATUS-{congress}-{kind}.zip"
 
 
+def refresh_bill_text(store, congress, progress):
+    first_year = 1789 + (congress - 1) * 2
+    sessions = (1, 2) if date.today().year > first_year else (1,)
+    errors = []
+    for session in sessions:
+        for kind, chamber in (("hr", "House"), ("s", "Senate")):
+            url = text_archive_url(congress, session, kind)
+            progress(f"Checking {chamber.lower()} bill text · session {session}…")
+            try:
+                archive, validators = fetch(url, store.get_setting(url))
+                if archive is not None:
+                    with store.connect() as db:
+                        db.execute("BEGIN IMMEDIATE")
+                        store.write_bill_text(db, archive)
+                        store.set_setting(url, validators, db)
+            except Exception as error:
+                errors.append(f"{chamber} bill text, session {session} — {error}")
+    return errors
+
+
 def refresh(store, progress=lambda message: None):
     congress = current_congress()
     errors = []
+    for cached_congress in sorted(store.cached_congresses() | {congress}, reverse=True):
+        errors.extend(refresh_bill_text(store, cached_congress, progress))
     count = 0
     for kind, chamber in (("hr", "House"), ("s", "Senate")):
         url = archive_url(congress, kind)

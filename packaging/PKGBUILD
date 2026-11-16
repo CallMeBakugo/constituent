@@ -1,6 +1,6 @@
-# Local Arch recipe. Build beside the released constituent-0.2.1.tar.gz.
+# Local Arch recipe. Build beside the released constituent-0.2.2.tar.gz.
 pkgname=constituent
-pkgver=0.2.1
+pkgver=0.2.2
 pkgrel=1
 pkgdesc='Local-first U.S. congressional bill tracking and advocacy'
 arch=('any')

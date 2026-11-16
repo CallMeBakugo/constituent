@@ -1,8 +1,10 @@
 import copy
+import io
 import tempfile
 import unittest
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
+from zipfile import ZipFile
 
 from constituent.advocacy import ensure_templates, letter, mailto
 from constituent.sources import lifecycle
@@ -28,6 +30,42 @@ class StoreTest(unittest.TestCase):
         chat = hubs[0]
         result = self.store.bills(chat["phrases"], "HR 7757")
         self.assertEqual([bill["bill_id"] for bill in result], ["H.R. 7757"])
+
+    def test_hub_matches_official_text_across_versions(self):
+        package = "BILLS-119hr7757rfs"
+        key = "119-hr-7757"
+
+        def archive_for(passage):
+            buffer = io.BytesIO()
+            with ZipFile(buffer, "w") as archive:
+                archive.writestr(
+                    f"{package}.xml",
+                    f"<bill><metadata>exclude this metadata</metadata>"
+                    f"<legis-body><text>{passage}</text></legis-body></bill>",
+                )
+            return buffer.getvalue()
+
+        raw = archive_for("An otherwise unindexed passage about encrypted consultations.")
+        with self.store.connect() as db:
+            self.store.write_bill_text(db, raw)
+            self.store.write_bill_text(db, raw)
+            self.assertEqual(db.execute(
+                "SELECT count(*) FROM bill_text_versions WHERE bill_key=?", (key,)
+            ).fetchone()[0], 1)
+
+        # The hub phrase and the requested title can match different index fields.
+        matches = self.store.bills("encrypted consultations", "HR 7757")
+        self.assertEqual([bill["key"] for bill in matches], [key])
+        snippet = self.store.text_match(key, "encrypted consultations")
+        self.assertEqual(snippet[0], package)
+        self.assertIn("encrypted consultations", snippet[1])
+        self.assertEqual(self.store.bills("exclude this metadata"), [])
+
+        with self.store.connect() as db:
+            self.store.write_bill_text(db, archive_for("A corrected passage about closed sessions."))
+            corrected = self.store.bills("closed sessions", "HR 7757", db=db)
+            self.assertEqual([bill["key"] for bill in corrected], [key])
+            self.assertEqual(self.store.bills("encrypted consultations", db=db), [])
 
     def test_new_action_alert_is_persistent_and_idempotent(self):
         bill = copy.deepcopy(self.store.bills("Farm Freedom to Repair Act")[0])
