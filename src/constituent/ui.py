@@ -4,11 +4,11 @@ import sqlite3
 from datetime import date
 from urllib.parse import urlsplit
 
-from PySide6.QtCore import QSize, Qt, QThread, QTimer, QUrl, Signal
+from PySide6.QtCore import QEvent, QSize, Qt, QThread, QTimer, QUrl, Signal
 from PySide6.QtGui import QColor, QDesktopServices, QFont, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QDialog, QFormLayout, QFrame, QHBoxLayout, QLabel,
-    QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QPushButton,
+    QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox, QPushButton,
     QScrollArea, QSizePolicy, QStackedWidget, QSystemTrayIcon, QTabWidget, QTextEdit,
     QVBoxLayout, QWidget,
 )
@@ -120,6 +120,7 @@ class Window(QMainWindow):
         self.view = "hub"
         self.active_bill = None
         self.worker = None
+        self.quitting = False
         self.sync_errors = []
         self.setWindowTitle("Constituent")
         self.resize(1350, 860)
@@ -165,7 +166,14 @@ class Window(QMainWindow):
 
         self.tray = QSystemTrayIcon(self.windowIcon(), self)
         self.tray.setToolTip("Constituent")
-        self.tray.activated.connect(lambda *_: self.showNormal())
+        self.tray.activated.connect(self.activate_tray)
+        self.tray.messageClicked.connect(self.restore_window)
+        tray_menu = QMenu(self)
+        tray_menu.addAction("Show Constituent", self.restore_window)
+        tray_menu.addSeparator()
+        tray_menu.addAction("Quit Constituent", self.request_quit)
+        self.tray.setContextMenu(tray_menu)
+        self.tray.show()
         self.poll = QTimer(self)
         self.poll.setInterval(4 * 60 * 60 * 1000)
         self.poll.timeout.connect(self.start_refresh)
@@ -260,7 +268,7 @@ class Window(QMainWindow):
             safe_open(GPO)
 
     def start_refresh(self):
-        if self.worker:
+        if self.quitting or self.worker:
             return
         self.worker = RefreshThread(self.store)
         self.worker.progress.connect(self.feed_status.setText)
@@ -272,8 +280,12 @@ class Window(QMainWindow):
     def release_worker(self):
         self.worker.deleteLater()
         self.worker = None
+        if self.quitting:
+            self.finish_quit()
 
     def refresh_done(self, count, errors):
+        if self.quitting:
+            return
         self.sync_errors = errors
         self.refresh_button.setEnabled(True)
         self.update_feed_status()
@@ -287,7 +299,6 @@ class Window(QMainWindow):
             message = f"New activity on {count} tracked {'bill' if count == 1 else 'bills'}."
             self.statusBar().showMessage(message, 10000)
             if QSystemTrayIcon.supportsMessages():
-                self.tray.show()
                 self.tray.showMessage("Constituent", message, QSystemTrayIcon.MessageIcon.Information)
             else:
                 from shutil import which
@@ -299,12 +310,50 @@ class Window(QMainWindow):
         else:
             self.statusBar().showMessage("Official records are up to date.", 6500)
 
+    def activate_tray(self, reason):
+        if reason in (QSystemTrayIcon.ActivationReason.Trigger, QSystemTrayIcon.ActivationReason.DoubleClick):
+            self.restore_window()
+
+    def restore_window(self):
+        if self.quitting:
+            return
+        self.setWindowState(self.windowState() & ~Qt.WindowState.WindowMinimized)
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.WindowStateChange and self.isMinimized():
+            QTimer.singleShot(0, self.hide_minimized_window)
+
+    def hide_minimized_window(self):
+        if self.isMinimized() and QSystemTrayIcon.isSystemTrayAvailable():
+            self.hide()
+
     def closeEvent(self, event):
-        if self.worker and self.worker.isRunning():
+        if not self.quitting and QSystemTrayIcon.isSystemTrayAvailable():
             event.ignore()
-            self.statusBar().showMessage("Wait for the official records refresh to finish before closing.", 7000)
+            self.hide()
+            return
+        if self.worker:
+            event.ignore()
+            self.request_quit()
             return
         super().closeEvent(event)
+
+    def request_quit(self):
+        self.quitting = True
+        self.poll.stop()
+        if self.worker:
+            self.tray.setToolTip("Constituent is finishing its refresh before quitting")
+            self.statusBar().showMessage("Finishing the current refresh before quitting.")
+        else:
+            self.finish_quit()
+
+    def finish_quit(self):
+        self.tray.hide()
+        QApplication.instance().quit()
 
     def replace_page(self, page, breadcrumb):
         previous = self.deck.currentWidget()

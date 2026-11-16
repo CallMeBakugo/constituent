@@ -11,11 +11,13 @@ Constituent is a Linux desktop app for tracking U.S. federal bills and preparing
 Requires Linux, Python 3.12 or newer, and a desktop session. Install the local wheel with [pipx](https://pipx.pypa.io/). pipx installs PySide6 and its Qt runtime with the app.
 
 ```sh
-pipx install ./constituent-0.2.0-py3-none-any.whl
+pipx install ./constituent-0.2.1-py3-none-any.whl
 constituent
 ```
 
 Dark mode is the default. Use **Switch to light mode** in the sidebar to change it. Constituent remembers your choice across launches.
+
+With a system tray available, minimizing or closing the window keeps Constituent in the tray and its refresh schedule stays active. Click the tray icon or the desktop launcher to bring the window back. To exit, right-click the tray icon and choose **Quit Constituent**.
 
 Start with `constituent --offline` to skip automatic refresh. The **Refresh** button still works in this mode. For source development, extract the source archive and run `pipx install .` from its root, or run `PYTHONPATH=src python -m constituent --offline` with PySide6 already installed.
 
