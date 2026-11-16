@@ -1,0 +1,25 @@
+# Local Arch recipe. Build beside the released constituent-0.2.0.tar.gz.
+pkgname=constituent
+pkgver=0.2.0
+pkgrel=1
+pkgdesc='Local-first U.S. congressional bill tracking and advocacy'
+arch=('any')
+license=('MIT')
+depends=('python' 'pyside6' 'noto-fonts')
+optdepends=('libnotify: notifications when the system tray cannot display them')
+makedepends=('python-build' 'python-installer' 'python-setuptools' 'python-wheel')
+source=("$pkgname-$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+build() {
+  cd "$pkgname-$pkgver"
+  python -m build --wheel --no-isolation
+}
+
+package() {
+  cd "$pkgname-$pkgver"
+  python -m installer --destdir="$pkgdir" dist/*.whl
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 packaging/constituent.desktop "$pkgdir/usr/share/applications/constituent.desktop"
+  install -Dm644 packaging/constituent.png "$pkgdir/usr/share/icons/hicolor/64x64/apps/constituent.png"
+}

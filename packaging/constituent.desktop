@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Constituent
+Comment=Track legislation and contact your representatives
+Exec=constituent
+Icon=constituent
+Terminal=false
+Categories=Office;
+StartupNotify=true
