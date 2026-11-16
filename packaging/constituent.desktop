@@ -7,3 +7,4 @@ Icon=constituent
 Terminal=false
 Categories=Office;
 StartupNotify=true
+StartupWMClass=Constituent
