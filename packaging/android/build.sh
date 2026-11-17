@@ -28,13 +28,18 @@ cp "$repo/LICENSE" "$project/LICENSE.txt"
 cp "$repo/packaging/android/README.md" "$project/Android-runtime-notice.txt"
 mkdir -p "$project/licenses"
 cp "$repo/packaging/android/licenses/"*.txt "$project/licenses/"
+wheel_dir="$stage/runtime-wheels"
+mkdir -p "$wheel_dir"
+qt_wheel="$wheel_dir/$(basename "$PYSIDE_ANDROID_WHEEL")"
+python "$repo/packaging/android/qt_widget_wheel.py" "$PYSIDE_ANDROID_WHEEL" "$qt_wheel"
+export CONSTITUENT_QT_WHEEL="$qt_wheel"
 cd "$project"
 
 if [[ ! -f buildozer.spec ]]; then
   pyside6-android-deploy --init --no-install --keep-deployment-files -f \
     --name Constituent --sdk-path "$ANDROID_SDK_ROOT" \
     --ndk-path "$ANDROID_SDK_ROOT/ndk/28.2.13676358" \
-    --wheel-pyside "$PYSIDE_ANDROID_WHEEL" --wheel-shiboken "$SHIBOKEN_ANDROID_WHEEL"
+    --wheel-pyside "$qt_wheel" --wheel-shiboken "$SHIBOKEN_ANDROID_WHEEL"
 fi
 
 python - "$repo/pyproject.toml" <<'PY'
@@ -58,6 +63,13 @@ spec["app"].update({
 })
 recipes = Path(spec["app"]["p4a.local_recipes"])
 from shutil import copytree
+pyside_recipe = recipes / "PySide6" / "__init__.py"
+lines = pyside_recipe.read_text().splitlines()
+pyside_recipe.write_text("\n".join(
+    f"    wheel_path = {os.environ['CONSTITUENT_QT_WHEEL']!r}"
+    if line.startswith("    wheel_path = ") else line
+    for line in lines
+) + "\n")
 copytree(Path(sys.argv[1]).parent / "packaging/android/recipes", recipes, dirs_exist_ok=True)
 spec["buildozer"]["bin_dir"] = str(Path.cwd().parent / "packages")
 with open("buildozer.spec", "w") as stream:

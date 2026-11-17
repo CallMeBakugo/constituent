@@ -1,7 +1,8 @@
 # Android build
 
 Constituent is MIT licensed. The Android build dynamically links the open-source
-Qt 6.12.0 and Qt for Python 6.12.0 runtime under LGPL 3.0. The license texts
+Qt 6.12.0 and Qt for Python 6.12.0 runtime under LGPL 3.0. The APK
+includes Qt Core, Gui, Widgets, and the Android platform plugin. The license texts
 are included in [licenses](licenses). The sources are available from
 [Qt](https://download.qt.io/official_releases/qt/6.12/6.12.0/single/) and
 [Qt for Python](https://code.qt.io/cgit/pyside/pyside-setup.git/tag/?h=v6.12.0).
