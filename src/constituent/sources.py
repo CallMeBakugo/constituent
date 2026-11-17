@@ -10,6 +10,8 @@ from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 from xml.etree import ElementTree as ET
 
+from .legislation import bill_stage
+
 GPO = "https://www.govinfo.gov/bulkdata/BILLSTATUS"
 HOUSE_XML = "https://clerk.house.gov/xml/lists/MemberData.xml"
 HOUSE_SITES = "https://www.house.gov/representatives"
@@ -18,11 +20,11 @@ HOUSE_LOOKUP = "https://www.house.gov/representatives/find-your-representative"
 FISC_OPINIONS = "https://www.fisc.uscourts.gov/public-filings"
 
 
-def fetch(url, validators=None):
+def fetch(url, validators=None, *, timeout=45):
     headers = {"User-Agent": "Constituent/0.2 (public congressional records)"}
     headers.update(validators or {})
     try:
-        with urlopen(Request(url, headers=headers), timeout=45) as response:
+        with urlopen(Request(url, headers=headers), timeout=timeout) as response:
             data = response.read(100 * 1024 * 1024 + 1)
             if len(data) > 100 * 1024 * 1024:
                 raise ValueError("Official download exceeded the supported size.")
@@ -80,42 +82,7 @@ class PlainText(HTMLParser):
 
 
 def lifecycle(actions, laws, kind):
-    """Recognize explicit milestones and leave ambiguous procedural votes alone."""
-    if laws:
-        return "Enacted"
-    status = "Proposed"
-    house_passed = senate_passed = False
-    for action in reversed(actions):
-        text = action["text"].lower()
-        code = action["code"]
-        if code in {"E30000", "E40000", "36000"} or text.startswith(
-            ("became public law", "became private law", "signed by president")
-        ):
-            return "Enacted"
-        if text.startswith(("vetoed by president", "pocket vetoed", "on passage failed",
-                            "failed of passage", "on passage of the bill failed")):
-            status = "Failed"
-        elif code == "8000" or text.startswith(("passed house", "on passage passed")):
-            house_passed = True
-            status = "Passed"
-        elif code == "17000" or text.startswith("passed senate"):
-            senate_passed = True
-            status = "Passed"
-        elif code in {"E20000", "28000"} or text.startswith(("presented to president", "cleared for white house")):
-            status = "Passed"
-        elif not (house_passed and senate_passed) and status != "Failed":
-            other_chamber = (kind == "HR" and house_passed) or (kind == "S" and senate_passed)
-            if not other_chamber or code in {"H14000", "H11100", "2000", "11000", "H12410"} or text.startswith(
-                ("received in the", "read twice and referred", "read twice and placed")
-            ):
-                if code in {"H12410", "H30000", "5000", "14000"} or text.startswith(
-                    ("placed on", "reported by", "committee on ", "considered by", "considered under")
-                ) and any(word in text for word in ("calendar", "reported by", "considered ")):
-                    status = "On Floor"
-                elif code in {"H11100", "H11200", "2000", "11000"} or "referred to the committee" in text:
-                    status = "In Committee"
-    return status
-
+    return bill_stage(actions, kind, enacted=bool(laws)).status
 
 
 def vote_page(url):
@@ -145,6 +112,7 @@ def bill_from_xml(data):
                 links.append((f"Roll call {number}", url))
             actions.append({
                 "date": date, "text": text, "code": field(item, "actionCode"),
+                "chamber": field(item, "sourceSystem/name"),
                 "links": list(dict.fromkeys((name, vote_page(url)) for name, url in links)),
             })
     actions.sort(key=lambda action: action["date"], reverse=True)
@@ -175,6 +143,13 @@ def bill_from_xml(data):
         "bill_id": f"{label} {number}", "number": number, "kind": kind,
         "title": field(node, "title"),
         "titles": [field(item, "title") for item in node.findall("titles/item")],
+        "substitutes": list(dict.fromkeys(
+            field(item, "title") for item in node.findall("titles/item")
+            if field(item, "billTextVersionCode") in {"EAH", "EAS"}
+            and field(item, "title") != field(node, "title")
+            and "short title" in field(item, "titleType").casefold()
+        )),
+        "laws": laws,
         "date": date, "latest": latest, "status": lifecycle(actions, laws, kind),
         "source": field(node, "legislationUrl"),
         "updated": field(node, "updateDate"),
@@ -287,6 +262,7 @@ def senate_members(data):
         contact = field(node, "email").removeprefix("mailto:")
         results.append({
             "id": member_id, "name": f"{field(node, 'first_name')} {field(node, 'last_name')}",
+            "last_name": field(node, "last_name"),
             "party": field(node, "party"), "state": field(node, "state"),
             "district": "", "chamber": "Senate", "phone": field(node, "phone"),
             "address": field(node, "address"),

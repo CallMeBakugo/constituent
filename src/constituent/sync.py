@@ -10,8 +10,8 @@ from .sources import (
 from .store import now
 
 
-def current_congress():
-    today = date.today()
+def current_congress(today=None):
+    today = today or date.today()
     year = today.year - int(today.year % 2 == 1 and (today.month, today.day) < (1, 3))
     return (year - 1789) // 2 + 1
 
@@ -29,12 +29,13 @@ def refresh_bill_text(store, congress, progress):
             url = text_archive_url(congress, session, kind)
             progress(f"Checking {chamber.lower()} bill text · session {session}…")
             try:
-                archive, validators = fetch(url, store.get_setting(url))
+                key = "text-dates-v2:" + url
+                archive, validators = fetch(url, store.get_setting(key))
                 if archive is not None:
                     with store.connect() as db:
                         db.execute("BEGIN IMMEDIATE")
                         store.write_bill_text(db, archive)
-                        store.set_setting(url, validators, db)
+                        store.set_setting(key, validators, db)
             except Exception as error:
                 errors.append(f"{chamber} bill text, session {session} — {error}")
     return errors
@@ -50,13 +51,14 @@ def refresh(store, progress=lambda message: None):
         url = archive_url(congress, kind)
         progress(f"Checking {chamber.lower()} bills…")
         try:
-            archive, validators = fetch(url, store.get_setting(url))
+            key = "legislative-stages-v2:" + url
+            archive, validators = fetch(url, store.get_setting(key))
             if archive is not None:
                 bills = bills_from_archive(archive)
                 with store.connect() as db:
                     db.execute("BEGIN IMMEDIATE")
                     new_actions = store.write_bills(db, bills, notify=True)
-                    store.set_setting(url, validators, db)
+                    store.set_setting(key, validators, db)
                 count += new_actions
         except Exception as error:
             errors.append(f"{chamber} bills — {error}")

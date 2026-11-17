@@ -1,5 +1,6 @@
 """Native Qt desktop interface for the local civic workspace."""
 
+import json
 import sqlite3
 from datetime import date
 from urllib.parse import urlsplit
@@ -7,13 +8,16 @@ from urllib.parse import urlsplit
 from PySide6.QtCore import QEvent, QSize, Qt, QThread, QTimer, QUrl, Signal
 from PySide6.QtGui import QColor, QDesktopServices, QFont, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (
-    QApplication, QComboBox, QDialog, QFormLayout, QFrame, QHBoxLayout, QLabel,
+    QApplication, QCheckBox, QComboBox, QDialog, QFormLayout, QFrame, QHBoxLayout, QLabel,
     QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox, QPushButton,
     QScrollArea, QSizePolicy, QStackedWidget, QSystemTrayIcon, QTabWidget, QTextEdit,
     QVBoxLayout, QWidget,
 )
 
 from .advocacy import ensure_templates, letter, mailto
+from .agency import AGENCY_OPINIONS, RULEMAKING, comment_window
+from .legislation import EVENT_LABELS, action_kind, bill_stage
+from .office_data import bill_votes, official_contact
 from .sources import FISC_OPINIONS, GPO, HOUSE_LOOKUP
 from .store import STATUSES, STATES
 from .sync import current_congress, refresh
@@ -108,10 +112,31 @@ class RefreshThread(QThread):
         self.result.emit(count, errors)
 
 
+class OfficeLookup(QThread):
+    contacts_ready = Signal(dict)
+    votes_ready = Signal(list)
+
+    def __init__(self, owner, bill, offices):
+        super().__init__(owner)
+        self.store, self.bill, self.offices = owner.store, bill, offices
+
+    def run(self):
+        from concurrent.futures import ThreadPoolExecutor
+        try:
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                votes = pool.submit(bill_votes, self.store, self.bill, self.offices)
+                forms = pool.map(lambda office: official_contact(self.store, office), self.offices)
+                self.contacts_ready.emit(dict(zip((office["id"] for office in self.offices), forms)))
+                self.votes_ready.emit(votes.result())
+        except Exception:
+            self.votes_ready.emit([])
+
+
 class Window(QMainWindow):
-    def __init__(self, store, config, *, automatic_refresh=True):
+    def __init__(self, store, config, *, automatic_refresh=True, mobile=False):
         super().__init__()
         self.store = store
+        self.mobile = mobile
         self.theme = store.get_setting("theme", DEFAULT_THEME)
         apply_theme(QApplication.instance(), self.theme)
         self.templates = ensure_templates(config)
@@ -120,11 +145,15 @@ class Window(QMainWindow):
         self.view = "hub"
         self.active_bill = None
         self.worker = None
+        self.office_workers = set()
         self.quitting = False
         self.sync_errors = []
         self.setWindowTitle("Constituent")
-        self.resize(1350, 860)
-        self.setMinimumSize(1060, 690)
+        if self.mobile:
+            self.resize(390, 780)
+        else:
+            self.resize(1350, 860)
+            self.setMinimumSize(1060, 690)
         logo = QPixmap(64, 64)
         logo.fill(Qt.GlobalColor.transparent)
         painter = QPainter(logo)
@@ -144,6 +173,7 @@ class Window(QMainWindow):
         self.sidebar, self.navigation = frame("sidebar", (16, 22, 16, 18), 10)
         self.sidebar.setFixedWidth(228)
         root.addWidget(self.sidebar)
+        self.sidebar.setVisible(not self.mobile)
 
         main = QWidget()
         main_layout = box(main, gap=0)
@@ -151,14 +181,25 @@ class Window(QMainWindow):
         top = QFrame()
         top.setObjectName("topbar")
         top.setFixedHeight(61)
-        top_layout = box(top, (24, 0, 24, 0), 13, horizontal=True)
+        margins = (8, 0, 8, 0) if self.mobile else (24, 0, 24, 0)
+        top_layout = box(top, margins, 9, horizontal=True)
         main_layout.addWidget(top)
         self.breadcrumb = label("", "strong")
-        top_layout.addWidget(self.breadcrumb)
+        if self.mobile:
+            self.mobile_menu = QMenu(self)
+            navigation = QPushButton("☰  Menu")
+            navigation.setMenu(self.mobile_menu)
+            top_layout.addWidget(navigation)
+            top_layout.addWidget(label("Constituent", "strong"))
+        else:
+            top_layout.addWidget(self.breadcrumb)
         top_layout.addStretch()
         self.feed_status = button("", self.sync_info, "link")
         self.feed_status.setToolTip("View data sources and the last refresh result")
-        top_layout.addWidget(self.feed_status)
+        if self.mobile:
+            top_layout.addWidget(button("Data", self.sync_info, "link"))
+        else:
+            top_layout.addWidget(self.feed_status)
         self.refresh_button = button("↻  Refresh", self.start_refresh)
         top_layout.addWidget(self.refresh_button)
         self.deck = QStackedWidget()
@@ -173,7 +214,8 @@ class Window(QMainWindow):
         tray_menu.addSeparator()
         tray_menu.addAction("Quit Constituent", self.request_quit)
         self.tray.setContextMenu(tray_menu)
-        self.tray.show()
+        if not self.mobile:
+            self.tray.show()
         self.poll = QTimer(self)
         self.poll.setInterval(4 * 60 * 60 * 1000)
         self.poll.timeout.connect(self.start_refresh)
@@ -184,6 +226,18 @@ class Window(QMainWindow):
         self.open_hub(1)
 
     def nav(self):
+        if self.mobile:
+            self.mobile_menu.clear()
+            for hub in self.store.hubs():
+                self.mobile_menu.addAction(hub["name"], lambda key=hub["id"]: self.open_hub(key))
+            self.mobile_menu.addAction("New hub", self.new_hub)
+            self.mobile_menu.addSeparator()
+            self.mobile_menu.addAction("Government directory", self.open_directory)
+            self.mobile_menu.addAction("What changed", self.open_activity)
+            self.mobile_menu.addAction("Civic diary", self.open_diary)
+            self.mobile_menu.addAction("My profile", self.edit_profile)
+            self.theme_switch = self.mobile_menu.addAction(self.theme_switch_label(), self.toggle_theme)
+            return
         while self.navigation.count():
             item = self.navigation.takeAt(0)
             if item.widget():
@@ -215,6 +269,7 @@ class Window(QMainWindow):
         self.navigation.addWidget(label("CIVIC TOOLS", "navLabel"))
         for name, key, handler in (
             ("Government directory", "directory", self.open_directory),
+            ("What changed", "activity", self.open_activity),
             ("Civic diary", "diary", self.open_diary),
             ("My profile", "profile", self.edit_profile),
         ):
@@ -271,7 +326,10 @@ class Window(QMainWindow):
         if self.quitting or self.worker:
             return
         self.worker = RefreshThread(self.store)
-        self.worker.progress.connect(self.feed_status.setText)
+        if self.mobile:
+            self.worker.progress.connect(lambda message: self.statusBar().showMessage(message))
+        else:
+            self.worker.progress.connect(self.feed_status.setText)
         self.worker.result.connect(self.refresh_done)
         self.worker.finished.connect(self.release_worker)
         self.refresh_button.setEnabled(False)
@@ -280,7 +338,7 @@ class Window(QMainWindow):
     def release_worker(self):
         self.worker.deleteLater()
         self.worker = None
-        if self.quitting:
+        if self.quitting and not self.office_workers:
             self.finish_quit()
 
     def refresh_done(self, count, errors):
@@ -295,8 +353,10 @@ class Window(QMainWindow):
             self.fill_directory()
         elif self.view == "filings":
             self.open_filings()
+        elif self.view == "activity":
+            self.open_activity()
         if count:
-            message = f"New activity on {count} tracked {'bill' if count == 1 else 'bills'}."
+            message = f"{count} new legislative {'action' if count == 1 else 'actions'}."
             self.statusBar().showMessage(message, 10000)
             if QSystemTrayIcon.supportsMessages():
                 self.tray.showMessage("Constituent", message, QSystemTrayIcon.MessageIcon.Information)
@@ -328,15 +388,15 @@ class Window(QMainWindow):
             QTimer.singleShot(0, self.hide_minimized_window)
 
     def hide_minimized_window(self):
-        if self.isMinimized() and QSystemTrayIcon.isSystemTrayAvailable():
+        if not self.mobile and self.isMinimized() and QSystemTrayIcon.isSystemTrayAvailable():
             self.hide()
 
     def closeEvent(self, event):
-        if not self.quitting and QSystemTrayIcon.isSystemTrayAvailable():
+        if not self.mobile and not self.quitting and QSystemTrayIcon.isSystemTrayAvailable():
             event.ignore()
             self.hide()
             return
-        if self.worker:
+        if self.worker or self.office_workers:
             event.ignore()
             self.request_quit()
             return
@@ -345,7 +405,7 @@ class Window(QMainWindow):
     def request_quit(self):
         self.quitting = True
         self.poll.stop()
-        if self.worker:
+        if self.worker or self.office_workers:
             self.tray.setToolTip("Constituent is finishing its refresh before quitting")
             self.statusBar().showMessage("Finishing the current refresh before quitting.")
         else:
@@ -370,9 +430,11 @@ class Window(QMainWindow):
         content.addWidget(label(title, "heroTitle", True))
         line = QHBoxLayout()
         line.addWidget(label(subtitle, "muted", True), 1)
-        if action:
+        if action and not self.mobile:
             line.addWidget(action)
         content.addLayout(line)
+        if action and self.mobile:
+            content.addWidget(action, alignment=Qt.AlignmentFlag.AlignLeft)
         layout.addWidget(hero)
 
     def open_hub(self, key):
@@ -382,10 +444,17 @@ class Window(QMainWindow):
         self.hub = next(hub for hub in self.store.hubs() if hub["id"] == key)
         page = QWidget()
         outer = box(page, (21, 17, 21, 19), 14)
+        heading = outer
+        if self.mobile:
+            toolbar = QWidget()
+            heading = box(toolbar, gap=10)
+            outer.addWidget(toolbar)
         action = None
-        if self.hub["name"] == "FISA Court Rulings":
+        if self.hub["id"] == 3:
             action = button("Court filings", self.open_filings)
-        self.page_header(outer, self.hub["name"], self.hub["description"], action)
+        elif self.hub["id"] == 2:
+            action = button("Public comments", self.open_comments)
+        self.page_header(heading, self.hub["name"], self.hub["description"], action)
         bar = QHBoxLayout()
         bar.setSpacing(10)
         self.search = QLineEdit()
@@ -397,14 +466,22 @@ class Window(QMainWindow):
         self.status_filter.addItems(["All statuses", *STATUSES])
         self.status_filter.setMinimumWidth(150)
         self.status_filter.currentIndexChanged.connect(lambda: self.fill_bills())
-        bar.addWidget(self.status_filter)
-        outer.addLayout(bar)
-        body = QHBoxLayout()
-        body.setSpacing(12)
-        outer.addLayout(body, 1)
+        if not self.mobile:
+            bar.addWidget(self.status_filter)
+        heading.addLayout(bar)
+        if self.mobile:
+            heading.addWidget(self.status_filter)
+        options = QHBoxLayout()
+        self.latest_text = QCheckBox("Latest published text only")
+        self.latest_text.toggled.connect(lambda: self.fill_bills())
+        options.addWidget(self.latest_text)
+        options.addStretch()
+        options.addWidget(button("Edit hub", lambda: self.hub_dialog(self.hub), "link"))
+        heading.addLayout(options)
         left, left_layout = frame("panel", (9, 13, 9, 8), 9)
-        left.setMinimumWidth(300)
-        left.setMaximumWidth(359)
+        if not self.mobile:
+            left.setMinimumWidth(300)
+            left.setMaximumWidth(359)
         row = QHBoxLayout()
         row.setContentsMargins(5, 0, 5, 0)
         row.addWidget(label("BILLS", "eyebrow"))
@@ -417,15 +494,27 @@ class Window(QMainWindow):
         self.results.setVerticalScrollMode(QListWidget.ScrollMode.ScrollPerPixel)
         self.results.currentItemChanged.connect(self.select_bill)
         left_layout.addWidget(self.results, 1)
-        body.addWidget(left, 3)
         right, self.detail = frame("panel", (0, 0, 0, 0), 0)
-        body.addWidget(right, 6)
+        if self.mobile:
+            self.hub_stack = QStackedWidget()
+            self.hub_stack.addWidget(left)
+            self.hub_stack.addWidget(right)
+            self.hub_stack.currentChanged.connect(lambda index: toolbar.setVisible(index == 0))
+            self.results.itemClicked.connect(lambda _: self.hub_stack.setCurrentIndex(1))
+            outer.addWidget(self.hub_stack, 1)
+        else:
+            body = QHBoxLayout()
+            body.setSpacing(12)
+            body.addWidget(left, 3)
+            body.addWidget(right, 6)
+            outer.addLayout(body, 1)
         self.replace_page(page, f"Legislation hubs  /  {self.hub['name']}")
         self.fill_bills()
 
     def fill_bills(self, keep=None):
         status = self.status_filter.currentText() if self.status_filter.currentIndex() else ""
-        self.visible_bills = self.store.bills(self.hub["phrases"], self.search.text(), status)
+        self.visible_bills = self.store.bills(self.hub["phrases"], self.search.text(), status,
+                                              latest_only=self.latest_text.isChecked())
         congress = current_congress()
         self.visible_bills.sort(key=lambda bill: bill["congress"] != congress)
         self.results.blockSignals(True)
@@ -443,7 +532,8 @@ class Window(QMainWindow):
             self.results.setItemWidget(item, card)
         self.results.blockSignals(False)
         if self.visible_bills:
-            self.results.setCurrentRow(index)
+            if not self.mobile or (keep and self.hub_stack.currentIndex() == 1):
+                self.results.setCurrentRow(index)
         else:
             self.active_bill = None
             self.clear_detail()
@@ -482,27 +572,41 @@ class Window(QMainWindow):
 
     def clear_detail(self):
         while self.detail.count():
-            self.detail.takeAt(0).widget().deleteLater()
+            widget = self.detail.takeAt(0).widget()
+            widget.hide()
+            widget.deleteLater()
 
     def select_bill(self, current, previous):
         if current is None:
             return
         bill = self.visible_bills[self.results.row(current)]
-        self.active_bill = bill
         if bill["unread"]:
             self.store.mark_read(bill["key"])
             bill["unread"] = False
             self.results.setItemWidget(current, self.bill_card(bill))
+        self.render_bill(bill, self.hub["phrases"], self.search.text(), self.latest_text.isChecked())
+        if self.mobile:
+            self.hub_stack.setCurrentIndex(1)
+
+    def render_bill(self, bill, phrases="", search="", latest_only=False):
+        self.active_bill = bill
         self.clear_detail()
         area, layout = plain_scroll((21, 16, 21, 20), 11)
         layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         self.detail.addWidget(area)
+        if self.mobile and self.view == "hub":
+            layout.addWidget(button("← Back to bills", lambda: self.hub_stack.setCurrentIndex(0), "link"))
         header = QHBoxLayout()
         header.addWidget(label(f"{bill['bill_id']}   /   {bill['congress']}th CONGRESS", "eyebrow"))
         header.addStretch()
         header.addWidget(badge(bill["status"]))
         layout.addLayout(header)
         layout.addWidget(label(bill["title"], "billTitle", True))
+        stage = bill_stage(bill["actions"], bill["kind"], bill["status"] == "Enacted")
+        layout.addWidget(label(stage.label, "strong", True))
+        substitutes = bill.get("substitutes", [])
+        if substitutes:
+            layout.addWidget(label("Chamber amendment · " + " / ".join(substitutes), "eyebrow", True))
         if bill["sponsors"]:
             layout.addWidget(label(bill["sponsors"][0]["name"], "muted", True))
         if bill["committees"]:
@@ -511,10 +615,22 @@ class Window(QMainWindow):
         row = QHBoxLayout()
         row.addWidget(button("Oppose", lambda: self.advocate(bill, "oppose"), "primary"))
         row.addWidget(button("Support", lambda: self.advocate(bill, "support")))
+        watched = self.store.is_watched(bill["key"])
+        watch = QPushButton("Watching" if watched else "Watch bill")
+        watch.setCheckable(True)
+        watch.setChecked(watched)
+        def set_watch(checked):
+            self.store.set_watched(bill["key"], checked)
+            watch.setText("Watching" if checked else "Watch bill")
+        watch.toggled.connect(set_watch)
+        row.addWidget(watch)
         row.addStretch()
-        if bill["source"]:
-            row.addWidget(button("Congress.gov ↗", lambda: safe_open(bill["source"]), "link"))
+        official = button("Congress.gov ↗", lambda: safe_open(bill["source"]), "link") if bill["source"] else None
+        if official and not self.mobile:
+            row.addWidget(official)
         layout.addLayout(row)
+        if official and self.mobile:
+            layout.addWidget(official, alignment=Qt.AlignmentFlag.AlignLeft)
         latest, latest_layout = frame("hero", (12, 10, 12, 10), 3)
         latest_layout.addWidget(label(f"LATEST ACTION   ·   {display_date(bill['date'])}", "eyebrow"))
         latest_layout.addWidget(label(bill["latest"] or "No action published.", "", True))
@@ -526,11 +642,14 @@ class Window(QMainWindow):
         summary_layout = box(summary, (0, 11, 0, 0), 8)
         summary_layout.addWidget(label("Official summary", "sectionTitle"))
         summary_layout.addWidget(label(bill["summary"] or "Congress has yet to publish a summary for this measure.", "", True))
-        match = self.store.text_match(bill["key"], self.hub["phrases"], self.search.text())
+        match = self.store.text_match(bill["key"], phrases, search, latest_only=latest_only)
         if match:
-            package, passage, source = match
+            package, passage, source, published, is_latest = match
             summary_layout.addWidget(rule())
-            summary_layout.addWidget(label("Matching bill text", "sectionTitle"))
+            heading = "Matching bill text" if is_latest else "Match in earlier bill text"
+            summary_layout.addWidget(label(heading, "sectionTitle"))
+            if published:
+                summary_layout.addWidget(label(display_date(published), "eyebrow"))
             quote = label(passage, "", True)
             quote.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
             summary_layout.addWidget(quote)
@@ -546,7 +665,11 @@ class Window(QMainWindow):
         if not bill["actions"]:
             timeline_layout.addWidget(label("No actions published.", "muted"))
         for action in bill["actions"]:
-            timeline_layout.addWidget(label(display_date(action["date"]), "eyebrow"))
+            heading = display_date(action["date"])
+            event = EVENT_LABELS.get(action_kind(action))
+            if event:
+                heading += " · " + event
+            timeline_layout.addWidget(label(heading, "eyebrow"))
             timeline_layout.addWidget(label(action["text"], "", True))
             for name, url in action["links"]:
                 if url:
@@ -600,19 +723,107 @@ class Window(QMainWindow):
             filings.addWidget(label(filing["title"], "strong", True))
             filings.addWidget(button("Official filing ↗", lambda _, url=filing["url"]: safe_open(url), "link"),
                               alignment=Qt.AlignmentFlag.AlignLeft)
+        filings.addWidget(rule())
+        filings.addWidget(label("Declassified opinions", "sectionTitle"))
+        for posted, title, url in AGENCY_OPINIONS:
+            filings.addWidget(label(f"ODNI · {display_date(posted)}", "eyebrow"))
+            filings.addWidget(label(title, "strong", True))
+            filings.addWidget(button("Official release ↗", lambda _, target=url: safe_open(target), "link"),
+                              alignment=Qt.AlignmentFlag.AlignLeft)
         filings.addStretch()
         layout.addWidget(panel, 1)
         self.replace_page(page, "FISA Court Rulings  /  Public filings")
 
+    def open_comments(self):
+        self.view = "comments"
+        page = QWidget()
+        layout = box(page, (21, 17, 21, 19), 14)
+        self.page_header(layout, "Public comments", "U.S. Copyright Office rulemaking",
+                         button("Back to bills", lambda: self.open_hub(self.hub_id)))
+        panel, content = frame("panel")
+        content.addWidget(label(RULEMAKING["title"], "sectionTitle", True))
+        content.addWidget(label(RULEMAKING["docket"], "muted", True))
+        next_round = comment_window()
+        content.addWidget(label(
+            f"Next deadline · {display_date(next_round[1])}" if next_round else "Comment rounds closed",
+            "eyebrow",
+        ))
+        for description, deadline in RULEMAKING["rounds"]:
+            content.addWidget(label(f"{display_date(deadline)} · {description}", "", True))
+        content.addWidget(button("How to submit comments ↗", lambda: safe_open(RULEMAKING["submit"]), "primary"),
+                          alignment=Qt.AlignmentFlag.AlignLeft)
+        for title, key in (("Regulations.gov docket ↗", "docket_url"), ("Federal Register notice ↗", "notice")):
+            content.addWidget(button(title, lambda _, url=RULEMAKING[key]: safe_open(url), "link"),
+                              alignment=Qt.AlignmentFlag.AlignLeft)
+        layout.addWidget(panel)
+        layout.addStretch()
+        self.replace_page(page, "DMCA Bullshit  /  Public comments")
+
+    def open_activity(self):
+        self.view = "activity"
+        page = QWidget()
+        layout = box(page, (21, 17, 21, 19), 14)
+        self.page_header(layout, "What changed", "New official actions and your watched bills")
+        panel, content = frame("panel")
+        area, entries = plain_scroll(gap=8)
+        content.addWidget(area)
+        entries.addWidget(label("Watching", "sectionTitle"))
+        watched = self.store.watched_bills()
+        if not watched:
+            entries.addWidget(label("Choose Watch bill on a bill to keep it here.", "muted", True))
+        for bill in watched:
+            entries.addWidget(button(f'{bill["bill_id"]} · {bill["title"][:31 if self.mobile else 85]}',
+                                     lambda _, key=bill["key"]: self.open_activity_bill(key), "link"),
+                              alignment=Qt.AlignmentFlag.AlignLeft)
+        entries.addWidget(rule())
+        entries.addWidget(label("New actions", "sectionTitle"))
+        activity = self.store.recent_activity()
+        if not activity:
+            entries.addWidget(label("New actions will appear after a refresh finds them.", "muted", True))
+        for entry in activity:
+            bill = json.loads(entry["data"])
+            entries.addWidget(button(f'{bill["bill_id"]} · {bill["title"][:31 if self.mobile else 85]}',
+                                     lambda _, key=entry["bill_key"]: self.open_activity_bill(key), "link"),
+                              alignment=Qt.AlignmentFlag.AlignLeft)
+            entries.addWidget(label(display_date(entry["date"]), "eyebrow"))
+            entries.addWidget(label(entry["text"], "", True))
+            entries.addWidget(rule())
+        entries.addStretch()
+        layout.addWidget(panel, 1)
+        self.replace_page(page, "What changed")
+
+    def open_activity_bill(self, key):
+        bill = self.store.get_bill(key)
+        if not bill:
+            return
+        self.view = "activity_bill"
+        self.store.mark_read(key)
+        page = QWidget()
+        outer = box(page, (21, 17, 21, 19), 12)
+        outer.addWidget(button("← What changed", self.open_activity, "link"),
+                        alignment=Qt.AlignmentFlag.AlignLeft)
+        panel, self.detail = frame("panel", (0, 0, 0, 0))
+        outer.addWidget(panel, 1)
+        self.replace_page(page, bill["bill_id"])
+        self.render_bill(bill)
+
     def new_hub(self):
+        self.hub_dialog()
+
+    def hub_dialog(self, hub=None):
         dialog = QDialog(self)
-        dialog.setWindowTitle("New legislation hub")
-        dialog.setMinimumWidth(460)
+        heading = "Edit hub" if hub else "New hub"
+        dialog.setWindowTitle(heading)
+        if not self.mobile:
+            dialog.setMinimumWidth(460)
         content = box(dialog, (22, 19, 22, 19))
-        content.addWidget(label("New hub", "sectionTitle"))
-        name, terms = QLineEdit(), QLineEdit()
+        content.addWidget(label(heading, "sectionTitle"))
+        name = QLineEdit(hub["name"] if hub else "")
+        terms = QLineEdit(hub["phrases"] if hub else "")
         terms.setPlaceholderText("e.g. right to repair, digital ownership")
         form = QFormLayout()
+        if self.mobile:
+            form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapAllRows)
         form.addRow("Hub name", name)
         form.addRow("Keywords", terms)
         content.addLayout(form)
@@ -621,15 +832,15 @@ class Window(QMainWindow):
         content.addWidget(error)
         def save():
             try:
-                hub = self.store.add_hub(name.text(), terms.text())
+                saved_id = self.store.add_hub(name.text(), terms.text(), hub["id"] if hub else None)
             except sqlite3.IntegrityError:
                 error.setText("A hub already uses that name.")
             except ValueError as exc:
                 error.setText(str(exc))
             else:
                 dialog.accept()
-                self.open_hub(hub)
-        save_button = button("Create hub", save, "primary")
+                self.open_hub(saved_id)
+        save_button = button("Save hub" if hub else "Create hub", save, "primary")
         save_button.setDefault(True)
         content.addWidget(save_button, alignment=Qt.AlignmentFlag.AlignRight)
         dialog.exec()
@@ -638,11 +849,14 @@ class Window(QMainWindow):
         profile = self.profile or {}
         dialog = QDialog(self)
         dialog.setWindowTitle("My profile")
-        dialog.setMinimumWidth(525)
+        if not self.mobile:
+            dialog.setMinimumWidth(525)
         content = box(dialog, (22, 19, 22, 19), 12)
         content.addWidget(label("My profile", "sectionTitle"))
         content.addWidget(label("Your address stays on this device until you choose to place it in a letter.", "muted", True))
         form = QFormLayout()
+        if self.mobile:
+            form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapAllRows)
         name = QLineEdit(profile.get("name", ""))
         address = QTextEdit()
         address.setPlainText(profile.get("address", ""))
@@ -703,27 +917,38 @@ class Window(QMainWindow):
         if not self.profile and not self.edit_profile():
             return
         offices = self.store.representatives(self.profile)
-        offices.sort(key=lambda office: office["chamber"] != ("House" if bill["kind"] == "HR" else "Senate"))
+        stage = bill_stage(bill["actions"], bill["kind"], bill["status"] == "Enacted")
+        offices.sort(key=lambda office: (
+            office["chamber"] != stage.chamber, not bool(office.get("form") or office.get("email"))
+        ))
         if not offices:
             QMessageBox.information(self, "No offices found", "Check your state and district in My profile.")
             return
         dialog = QDialog(self)
         dialog.setWindowTitle(f"{stance.title()} {bill['bill_id']}")
-        dialog.setMinimumWidth(600)
+        if not self.mobile:
+            dialog.setMinimumWidth(600)
         content = box(dialog, (22, 18, 22, 18), 10)
         content.addWidget(label(f"{stance.title()} {bill['bill_id']}", "sectionTitle"))
-        content.addWidget(label("Choose a recipient. You can review the letter before sending it.", "muted", True))
+        content.addWidget(label(stage.label, "muted", True))
         office_picker = QComboBox()
         for office in offices:
             office_picker.addItem(f"{office['name']} · U.S. {office['chamber']}", office)
         content.addWidget(office_picker)
+        votes_area = QComboBox()
+        votes_area.setVisible(False)
+        content.addWidget(votes_area)
+        vote_link = button("Official roll call ↗", lambda: safe_open(votes_area.currentData()), "link")
+        vote_link.setVisible(False)
+        content.addWidget(vote_link, alignment=Qt.AlignmentFlag.AlignLeft)
+        contacts, roll_calls = {}, []
         subject_label = label("", "strong", True)
         content.addWidget(subject_label)
         preview = QTextEdit()
         preview.setAcceptRichText(False)
-        preview.setMinimumHeight(240)
+        preview.setMinimumHeight(145 if self.mobile else 240)
         content.addWidget(preview)
-        footer = QHBoxLayout()
+        footer = QVBoxLayout() if self.mobile else QHBoxLayout()
         content.addLayout(footer)
         note = label("", "muted", True)
         content.addWidget(note)
@@ -735,6 +960,18 @@ class Window(QMainWindow):
         footer.addWidget(copy_subject)
         footer.addStretch()
         office_picker.currentIndexChanged.connect(lambda _: show_letter())
+
+        def update_office():
+            office = office_picker.currentData()
+            form = contacts.get(office["id"]) or office["form"]
+            action.setText("Open email draft" if office["email"] else
+                           "Copy & open contact page" if form else "Copy & open office site")
+            votes_area.clear()
+            for official, vote, day, kind, url in roll_calls:
+                if official == office["id"]:
+                    votes_area.addItem(f"{vote} · {kind} · {display_date(day)}", url)
+            votes_area.setVisible(votes_area.count() > 0)
+            vote_link.setVisible(votes_area.count() > 0)
 
         def show_letter():
             office = office_picker.currentData()
@@ -753,8 +990,7 @@ class Window(QMainWindow):
             copy.setEnabled(True)
             copy_subject.setEnabled(True)
             action.setEnabled(bool(office["email"] or office["form"] or office["site"]))
-            action.setText("Open email draft" if office["email"] else
-                           "Copy & open contact page" if office["form"] else "Copy & open office site")
+            update_office()
             note.setText("Your diary records the handoff. You can mark the letter sent after submitting it.")
 
         def handoff(copy_only=False):
@@ -767,7 +1003,7 @@ class Window(QMainWindow):
                 QApplication.clipboard().setText(body)
                 if copy_only:
                     outcome = "Copied"
-                elif safe_open(office["form"] or office["site"]):
+                elif safe_open(contacts.get(office["id"]) or office["form"] or office["site"]):
                     outcome = "Contact opened"
                 else:
                     outcome = "Copied"
@@ -781,8 +1017,36 @@ class Window(QMainWindow):
                 outcome = "Draft opened"
             self.store.log(bill["bill_id"], office["name"], stance, outcome)
             note.setText(f"{outcome} for {office['name']}. Recorded in your civic diary.")
+        def display_contacts(forms):
+            contacts.update(forms)
+            update_office()
+
+        def display_votes(votes):
+            roll_calls.extend(votes)
+            update_office()
+
+        def release_lookup():
+            self.office_workers.remove(worker)
+            worker.deleteLater()
+            if self.quitting and not (self.worker or self.office_workers):
+                self.finish_quit()
+
         show_letter()
-        dialog.exec()
+        worker = OfficeLookup(self, bill, offices)
+        self.office_workers.add(worker)
+        worker.contacts_ready.connect(display_contacts, Qt.ConnectionType.QueuedConnection)
+        worker.votes_ready.connect(display_votes, Qt.ConnectionType.QueuedConnection)
+        worker.finished.connect(release_lookup, Qt.ConnectionType.QueuedConnection)
+        worker.start()
+        try:
+            dialog.exec()
+        finally:
+            if worker in self.office_workers:
+                worker.contacts_ready.disconnect(display_contacts)
+                worker.votes_ready.disconnect(display_votes)
+                worker.finished.connect(dialog.deleteLater)
+            else:
+                dialog.deleteLater()
 
     def open_directory(self):
         self.view = "directory"
@@ -843,7 +1107,8 @@ class Window(QMainWindow):
             return
         dialog = QDialog(self)
         dialog.setWindowTitle(member["name"])
-        dialog.resize(640, 535)
+        if not self.mobile:
+            dialog.resize(640, 535)
         content = box(dialog, (20, 17, 20, 17))
         content.addWidget(label(member["name"], "sectionTitle"))
         content.addWidget(label(f"{member['chamber']} · {member['state']} · {member['party']}", "eyebrow"))
